@@ -2,8 +2,7 @@
 
 # Dreame Vacuum for Omarchy
 
-**Control your Dreame robot vacuum from the [Omarchy](https://omarchy.org) bar.
-No Home Assistant needed.**
+**Control your Dreame robot vacuum from the [Omarchy](https://omarchy.org) bar.**
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Omarchy shell plugin](https://img.shields.io/badge/omarchy-shell%20plugin-8a7fd4)](https://omarchy.org)

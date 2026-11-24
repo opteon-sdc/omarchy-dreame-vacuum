@@ -204,7 +204,7 @@ def import_library():
 
 
 class Locale:
-    """Labels from the Home Assistant integration's translation files."""
+    """Labels from the dreame library's translation files."""
 
     def __init__(self, lang: str):
         self.data = {}
