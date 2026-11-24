@@ -1,0 +1,92 @@
+#!/bin/bash
+# omarchy plugin add only copies files; this installs what the plugin needs to run:
+#   1. a private Python venv with the library's dependencies
+#   2. Tasshack's dreame library (pinned release, checksum verified)
+#   3. the dreame-vacuum command in ~/.local/bin
+#   4. a systemd user service that keeps the connection to your robot open
+#   5. a login to your Dreamehome account (only when none is saved yet)
+
+set -euo pipefail
+
+here="$(cd "$(dirname "$0")" && pwd)"
+lib_version="v2.0.3"
+lib_sha256="7e0aa4bc6f857ce13fbafd025abc468579bfdd6c49739f7f44641b595eb55bc6"
+lib_url="https://github.com/Tasshack/dreame-vacuum/archive/refs/tags/${lib_version}.tar.gz"
+
+share="${XDG_DATA_HOME:-$HOME/.local/share}/dreame-vacuum"
+bin="$HOME/.local/bin"
+unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+
+need() { command -v "$1" >/dev/null 2>&1; }
+
+need python3 || omarchy pkg add python
+need curl || omarchy pkg add curl
+
+mkdir -p "$share" "$bin" "$unit_dir"
+
+echo "Creating the Python environment in $share/venv..."
+if [[ ! -x $share/venv/bin/python ]]; then
+  python3 -m venv "$share/venv"
+fi
+"$share/venv/bin/python" -m pip install --quiet --upgrade pip
+"$share/venv/bin/python" -m pip install --quiet -r "$here/cli/requirements.txt"
+
+if [[ $(cat "$share/lib/VERSION" 2>/dev/null) != "$lib_version" ]]; then
+  echo "Downloading the dreame library $lib_version..."
+  work=$(mktemp -d)
+  trap 'rm -rf "$work"' EXIT
+  curl -fsSL "$lib_url" -o "$work/lib.tar.gz"
+  echo "$lib_sha256  $work/lib.tar.gz" | sha256sum -c --quiet -
+  mkdir "$work/src"
+  tar -xzf "$work/lib.tar.gz" -C "$work/src" --strip-components=3 \
+    "dreame-vacuum-${lib_version#v}/custom_components/dreame_vacuum/dreame" \
+    "dreame-vacuum-${lib_version#v}/custom_components/dreame_vacuum/translations"
+  tar -xzf "$work/lib.tar.gz" -C "$work" --strip-components=1 "dreame-vacuum-${lib_version#v}/LICENSE"
+  rm -rf "$share/lib"
+  mkdir -p "$share/lib"
+  cp -r "$work/src/dreame" "$work/src/translations" "$share/lib/"
+  cp "$work/LICENSE" "$share/lib/LICENSE.dreame-vacuum"
+  echo "$lib_version" >"$share/lib/VERSION"
+fi
+
+install -m 0644 "$here/cli/dreame-vacuum.py" "$share/dreame-vacuum.py"
+cat >"$bin/dreame-vacuum" <<WRAPPER
+#!/bin/sh
+exec "$share/venv/bin/python" -I "$share/dreame-vacuum.py" "\$@"
+WRAPPER
+chmod 0755 "$bin/dreame-vacuum"
+
+cat >"$unit_dir/dreame-vacuum.service" <<UNIT
+[Unit]
+Description=Dreame robot vacuum connection (dreame-vacuum)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=$bin/dreame-vacuum serve
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+UNIT
+
+systemctl --user daemon-reload
+
+config="${XDG_CONFIG_HOME:-$HOME/.config}/dreame-vacuum/config.json"
+if [[ ! -f $config ]]; then
+  if [[ -t 0 ]]; then
+    echo
+    echo "Log in with your Dreamehome account (the password is stored in $config, readable only by you)."
+    "$bin/dreame-vacuum" login || echo "Login failed; run 'dreame-vacuum login' to try again."
+  else
+    echo "Log in later with: dreame-vacuum login"
+  fi
+fi
+
+systemctl --user enable dreame-vacuum.service >/dev/null 2>&1
+systemctl --user restart dreame-vacuum.service
+
+echo
+echo "dreame-vacuum is running as a user service."
+echo "Try: dreame-vacuum status"

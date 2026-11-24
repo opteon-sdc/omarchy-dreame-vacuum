@@ -1,0 +1,71 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.opteon-sdc.dreame",
+  "name": "Dreame Vacuum",
+  "version": "1.0.0",
+  "author": "opteon-sdc",
+  "license": "MIT",
+  "description": "Start, pause, dock and locate your Dreame robot vacuum, pick the suction level, clean single rooms and watch the live map from the Omarchy bar. Built on Tasshack's dreame-vacuum library.",
+  "homepage": "https://github.com/opteon-sdc/omarchy-dreame-vacuum",
+  "repository": "https://github.com/opteon-sdc/omarchy-dreame-vacuum",
+  "keywords": ["dreame", "mova", "robot-vacuum", "vacuum", "smart-home", "dreamehome"],
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Dreame Vacuum",
+    "description": "Control your Dreame robot vacuum: start, pause, dock, suction, rooms and map.",
+    "category": "Utilities",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "barLabel": "cleaning",
+      "notify": true,
+      "showMap": true,
+      "panelWidth": 420,
+      "cliPath": ""
+    },
+    "schema": [
+      {
+        "key": "barLabel",
+        "type": "enum",
+        "label": "Battery on the bar",
+        "options": ["cleaning", "always", "never"],
+        "defaultValue": "cleaning",
+        "description": "Show the battery level next to the bar icon while cleaning, always, or never."
+      },
+      {
+        "key": "notify",
+        "type": "boolean",
+        "label": "Notifications",
+        "description": "Notify when a cleaning job finishes or the robot reports an error.",
+        "defaultValue": true
+      },
+      {
+        "key": "showMap",
+        "type": "boolean",
+        "label": "Show the map",
+        "description": "Show the live map in the panel.",
+        "defaultValue": true
+      },
+      {
+        "key": "panelWidth",
+        "type": "integer",
+        "label": "Panel width",
+        "min": 340,
+        "max": 800,
+        "step": 20,
+        "defaultValue": 420
+      },
+      {
+        "key": "cliPath",
+        "type": "path",
+        "label": "Path to dreame-vacuum",
+        "description": "Leave empty to find dreame-vacuum on PATH.",
+        "defaultValue": ""
+      }
+    ],
+    "aliases": ["vacuum", "robot", "dreame", "stofzuiger", "cleaning"]
+  }
+}

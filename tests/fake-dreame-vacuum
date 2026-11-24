@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""A stand-in for dreame-vacuum with a demo robot, for tests and screenshots.
+
+It speaks the same JSON as the real client. State lives in
+$XDG_RUNTIME_DIR/fake-dreame-vacuum.json so commands change what `watch` shows.
+"""
+
+import json
+import os
+import sys
+import tempfile
+import time
+
+STATE = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir(), "fake-dreame-vacuum.json")
+LEVELS = ["quiet", "standard", "strong", "turbo"]
+LABELS = {"quiet": "Quiet", "standard": "Standard", "strong": "Strong", "turbo": "Turbo"}
+STATUS = {
+    "docked": ("charging", "Charging"),
+    "cleaning": ("cleaning", "Cleaning"),
+    "paused": ("paused", "Paused"),
+    "returning": ("returning", "Returning to dock"),
+}
+
+
+def base():
+    return {
+        "activity": "docked", "battery": 87, "suction": "standard",
+        "area": 0, "minutes": 0, "room": "", "error": "",
+    }
+
+
+def load():
+    try:
+        with open(STATE, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return base()
+
+
+def save(s):
+    with open(STATE, "w", encoding="utf-8") as f:
+        json.dump(s, f)
+
+
+def render(s):
+    a = s["activity"]
+    key, label = STATUS[a]
+    running = a in ("cleaning", "paused")
+    return {
+        "configured": True, "connected": True, "connecting": False, "error": "", "authFailed": False,
+        "name": "Demo L10s Ultra", "model": "dreame.vacuum.r2228o", "firmware": "4.3.9_1286",
+        "updated": int(time.time() * 1000), "available": True,
+        "activity": a, "status": key, "statusLabel": label, "statusCode": 2,
+        "taskStatus": key, "taskStatusLabel": label,
+        "hasError": bool(s["error"]), "hasWarning": False,
+        "errorCode": "brush" if s["error"] else "", "errorLabel": s["error"],
+        "battery": s["battery"], "charging": a == "docked", "docked": a == "docked",
+        "running": running, "paused": a == "paused", "returning": a == "returning",
+        "suction": s["suction"], "suctionLabel": LABELS[s["suction"]],
+        "suctionOptions": [{"value": v, "label": LABELS[v]} for v in LEVELS],
+        "suctionAvailable": True, "cleaningMode": "sweeping_and_mopping",
+        "cleaningModeLabel": "Sweeping and mopping",
+        "cleanedArea": s["area"], "cleaningTime": s["minutes"], "cleaningProgress": None,
+        "currentRoom": s["room"] if running else "",
+        "rooms": [
+            {"id": 1, "name": "Living room", "order": 1},
+            {"id": 2, "name": "Kitchen", "order": 2},
+            {"id": 3, "name": "Hallway", "order": 3},
+            {"id": 4, "name": "Bedroom", "order": 4},
+            {"id": 5, "name": "<b>Office</b>", "order": 5},
+        ],
+        "consumables": [
+            {"key": "main_brush", "label": "Main brush", "percent": 64},
+            {"key": "side_brush", "label": "Side brush", "percent": 41},
+            {"key": "filter", "label": "Filter", "percent": 8},
+        ],
+        "map": None,
+    }
+
+
+def out(doc):
+    print(json.dumps(doc), flush=True)
+
+
+def main(argv):
+    args = [a for a in argv if a not in ("--output", "json")]
+    while args and args[0] == "--lang":
+        args = args[2:]
+    if not args:
+        print("usage: fake-dreame-vacuum <command>", file=sys.stderr)
+        return 2
+    cmd, rest = args[0], args[1:]
+    s = load()
+    if cmd == "watch":
+        last = None
+        while True:
+            doc = render(load())
+            cmp = dict(doc, updated=0)
+            if cmp != last:
+                out({"ok": True, "data": doc})
+                last = cmp
+            time.sleep(float(os.environ.get("FAKE_WATCH_INTERVAL", "0.5")))
+    if cmd == "status":
+        out({"ok": True, "data": render(s)})
+        return 0
+    if cmd == "rooms":
+        out({"ok": True, "data": render(s)["rooms"]})
+        return 0
+    if cmd in ("start", "toggle"):
+        if cmd == "toggle" and s["activity"] == "cleaning":
+            s["activity"] = "paused"
+        else:
+            s.update(activity="cleaning", room=s["room"] or "Living room", area=s["area"] or 12, minutes=s["minutes"] or 9)
+    elif cmd == "pause":
+        s["activity"] = "paused"
+    elif cmd == "stop":
+        s.update(activity="docked" if s["activity"] == "docked" else "returning")
+    elif cmd == "dock":
+        s["activity"] = "returning"
+    elif cmd == "locate":
+        pass
+    elif cmd == "suction":
+        if not rest or rest[0] not in LEVELS:
+            out({"ok": False, "error": {"message": "bad level"}})
+            return 1
+        s["suction"] = rest[0]
+    elif cmd == "clean-rooms":
+        ids = [r for r in rest if r.isdigit()]
+        if not ids:
+            out({"ok": False, "error": {"message": "give one or more room ids"}})
+            return 1
+        names = {r["id"]: r["name"] for r in render(s)["rooms"]}
+        s.update(activity="cleaning", room=names.get(int(ids[0]), ""), area=0, minutes=0)
+    elif cmd == "fake-error":
+        s["error"] = "The main brush is tangled"
+    elif cmd == "fake-reset":
+        s = base()
+    else:
+        out({"ok": False, "error": {"message": f"unknown command: {cmd}"}})
+        return 1
+    save(s)
+    out({"ok": True, "data": {"command": cmd}})
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except (KeyboardInterrupt, BrokenPipeError):
+        sys.exit(0)

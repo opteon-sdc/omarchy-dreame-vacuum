@@ -1,0 +1,12 @@
+# Runtime dependencies of Tasshack's dreame library, pinned to the versions
+# this plugin is tested with. setup installs them into a private venv.
+certifi==2026.11.20
+cryptography==50.0.2
+mini-racer==0.14.1
+numpy==2.5.5
+paho-mqtt==2.2.0
+pillow==13.0.0
+pycryptodome==4.6.0
+pyOpenSSL==26.4.0
+python-miio==0.5.12
+requests==2.34.2
