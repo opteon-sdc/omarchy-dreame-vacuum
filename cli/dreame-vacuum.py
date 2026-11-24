@@ -21,6 +21,7 @@ import os
 import signal
 import socket
 import socketserver
+import subprocess
 import sys
 import tempfile
 import threading
@@ -29,10 +30,11 @@ import traceback
 from pathlib import Path
 
 APP = "dreame-vacuum"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 ACCOUNT_TYPES = ("dreame", "mova", "trouver", "mi")
 COUNTRIES = ("eu", "cn", "us", "ru", "sg", "kr", "by")
 SUCTION_LEVELS = ("quiet", "standard", "strong", "turbo")
+CLEANING_MODES = ("sweeping", "mopping", "sweeping_and_mopping", "mopping_after_sweeping")
 MAX_LINE = 64 * 1024
 
 LOG = logging.getLogger(APP)
@@ -60,6 +62,10 @@ def socket_path() -> Path:
 
 def map_path() -> Path:
     return runtime_dir() / "map.png"
+
+
+def routines_path() -> Path:
+    return config_dir() / "routines.json"
 
 
 def data_dir() -> Path:
@@ -97,6 +103,88 @@ def save_config(cfg: dict) -> None:
         except OSError:
             pass
         raise
+
+
+# ---------------------------------------------------------------- routines
+
+_routines_cache: tuple = (None, [])
+
+
+def load_routines() -> list:
+    """Routines from routines.json, validated. Re-read when the file changes."""
+    global _routines_cache
+    path = routines_path()
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return []
+    if _routines_cache[0] == mtime:
+        return _routines_cache[1]
+    try:
+        with path.open(encoding="utf-8") as f:
+            doc = json.load(f)
+    except (OSError, ValueError) as ex:
+        LOG.warning("Ignoring %s: %s", path, ex)
+        _routines_cache = (mtime, [])
+        return []
+    items = doc.get("routines") if isinstance(doc, dict) else doc
+    out = []
+    seen = set()
+    for r in items if isinstance(items, list) else []:
+        if not isinstance(r, dict):
+            continue
+        rid = str(r.get("id", "")).strip().lower()
+        if not rid or len(rid) > 32 or not all(c.isalnum() or c in "-_" for c in rid) or rid in seen:
+            LOG.warning("Skipping routine with a bad or duplicate id: %r", r.get("id"))
+            continue
+        rooms = r.get("rooms")
+        if not isinstance(rooms, list) or not rooms or len(rooms) > 32:
+            LOG.warning("Skipping routine %s: it needs a list of rooms", rid)
+            continue
+        rooms = [x if isinstance(x, int) else str(x)[:64] for x in rooms if isinstance(x, (int, str))]
+        mode = r.get("mode")
+        mode = str(mode).lower() if mode else None
+        if mode is not None and mode not in CLEANING_MODES:
+            LOG.warning("Skipping routine %s: mode must be one of %s", rid, ", ".join(CLEANING_MODES))
+            continue
+        suction = r.get("suction")
+        suction = str(suction).lower() if suction else None
+        if suction is not None and suction not in SUCTION_LEVELS:
+            LOG.warning("Skipping routine %s: suction must be one of %s", rid, ", ".join(SUCTION_LEVELS))
+            continue
+        try:
+            repeats = max(1, min(3, int(r.get("repeats") or 1)))
+        except (TypeError, ValueError):
+            repeats = 1
+        seen.add(rid)
+        out.append(
+            {
+                "id": rid,
+                "name": str(r.get("name") or rid)[:64],
+                "rooms": rooms,
+                "mode": mode,
+                "suction": suction,
+                "repeats": repeats,
+            }
+        )
+        if len(out) >= 24:
+            break
+    _routines_cache = (mtime, out)
+    return out
+
+
+def resolve_rooms(wanted: list, rooms: list) -> tuple[list, list]:
+    """Map room names (any case) or ids to ids on the current map."""
+    by_name = {r["name"].casefold(): r["id"] for r in rooms}
+    ids = {r["id"] for r in rooms}
+    found, missing = [], []
+    for w in wanted:
+        rid = w if isinstance(w, int) and w in ids else by_name.get(str(w).casefold())
+        if rid is None:
+            missing.append(str(w))
+        elif rid not in found:
+            found.append(rid)
+    return found, missing
 
 
 # ---------------------------------------------------------------- library
@@ -139,6 +227,19 @@ class Locale:
             return self.data["entity"][platform][key]["state"][value]
         except (KeyError, TypeError):
             return value.replace("_", " ").capitalize()
+
+    def error(self, ex) -> str:
+        """A library exception as a sentence in this language."""
+        key = getattr(ex, "translation_key", None)
+        if not key:
+            return str(ex) or type(ex).__name__
+        try:
+            message = self.data["exceptions"][key]["message"]
+        except (KeyError, TypeError):
+            message = key.replace("_", " ").capitalize()
+        for name, value in (getattr(ex, "translation_placeholders", None) or {}).items():
+            message = message.replace("{" + name + "}", str(value).replace("_", " "))
+        return message
 
 
 _locales: dict[str, Locale] = {}
@@ -185,6 +286,10 @@ class Vacuum:
         self._map_key = None
         self._map_wanted = threading.Event()
         self._stopping = False
+        # Notification edge detection: None means "not seen yet", so a restart
+        # does not repeat what was already announced.
+        self._seen_completed = None
+        self._seen_problem = None
 
     # -- lifecycle
 
@@ -249,6 +354,12 @@ class Vacuum:
                 self.auth_failed = False
                 self.connecting = False
                 self._map_wanted.set()
+                self._seen_completed = bool(safe(lambda: device.status.cleanup_completed, False))
+                self._seen_problem = (
+                    safe(lambda: device.status.error_name, "")
+                    if safe(lambda: device.status.has_error or device.status.has_warning, False)
+                    else ""
+                )
                 self.notify()
                 LOG.info("Connected to %s", cfg.get("name") or cfg.get("model"))
                 return
@@ -283,7 +394,71 @@ class Vacuum:
 
     def _on_change(self, *_args):
         self._map_wanted.set()
+        try:
+            self._announce()
+        except Exception as ex:
+            LOG.debug("Announce failed: %s", ex)
         self.notify()
+
+    # -- desktop notifications
+
+    def _announce(self):
+        """Notify once when a job really finishes, and when a new problem shows up.
+
+        The library's cleanup_completed only turns true when the task is done, not
+        when the robot docks mid-job to wash its mop pads or recharge.
+        """
+        device = self.device
+        if device is None:
+            return
+        s = device.status
+        completed = bool(safe(lambda: s.cleanup_completed, False))
+        if self._seen_completed is False and completed:
+            loc = locale_for(self.cfg.get("notify_lang") or "en")
+            try:
+                title = loc.data["entity_component"]["notification"]["state"]["cleanup_completed"]
+            except (KeyError, TypeError):
+                title = "Cleaning completed"
+            P = self.lib.DreameVacuumProperty
+            area = safe(lambda: device.get_property(P.CLEANED_AREA), 0)
+            minutes = safe(lambda: device.get_property(P.CLEANING_TIME), 0)
+            self._send(title, f"{self.cfg.get('name') or 'Dreame'}: {area} m² · {minutes} min", "normal")
+        self._seen_completed = completed
+
+        has_error = bool(safe(lambda: s.has_error, False))
+        has_warning = bool(safe(lambda: s.has_warning, False))
+        problem = safe(lambda: s.error_name, "") if has_error or has_warning else ""
+        if self._seen_problem is not None and problem and problem != self._seen_problem:
+            loc = locale_for(self.cfg.get("notify_lang") or "en")
+            self._send(
+                self.cfg.get("name") or "Dreame",
+                loc.state("sensor", "error", problem),
+                "critical" if has_error else "normal",
+            )
+        self._seen_problem = problem
+
+    def _send(self, title: str, body: str, urgency: str):
+        if not self.cfg.get("notify", True):
+            return
+        LOG.info("Notify: %s: %s", title, body)
+        try:
+            subprocess.Popen(
+                ["notify-send", "--app-name=Dreame", "--icon=robot-vacuum", f"--urgency={urgency}", title, body],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except OSError as ex:
+            LOG.warning("notify-send failed: %s", ex)
+
+    def set_notify(self, enabled: bool, lang: str):
+        if self.cfg.get("notify") == enabled and self.cfg.get("notify_lang") == lang:
+            return
+        self.cfg["notify"] = enabled
+        self.cfg["notify_lang"] = lang
+        if self.configured:
+            save_config(self.cfg)
 
     def _on_error(self, ex):
         self.last_error = str(ex) or type(ex).__name__
@@ -402,6 +577,7 @@ class Vacuum:
             return safe(lambda: device.get_property(getattr(P, name)), default)
 
         room = safe(lambda: s.current_room)
+        rooms = self._rooms(s)
         out.update(
             {
                 "connected": bool(safe(lambda: device.device_connected, False)),
@@ -433,6 +609,11 @@ class Vacuum:
                 ],
                 "suctionAvailable": not bool(safe(lambda: s.suction_unavailable, False)),
                 "cleaningMode": safe(lambda: s.cleaning_mode_name, ""),
+                "cleaningModeOptions": [
+                    {"value": v, "label": loc.state("select", "cleaning_mode", v)}
+                    for v in CLEANING_MODES
+                    if v in (safe(lambda: list(s.cleaning_mode_list or {}), None) or CLEANING_MODES)
+                ],
                 "cleaningModeLabel": loc.state("select", "cleaning_mode", safe(lambda: s.cleaning_mode_name, ""))
                 if safe(lambda: s.cleaning_mode_name, "")
                 else "",
@@ -440,7 +621,11 @@ class Vacuum:
                 "cleaningTime": prop("CLEANING_TIME", 0),
                 "cleaningProgress": prop("CLEANING_PROGRESS"),
                 "currentRoom": safe(lambda: room.name, "") if room is not None else "",
-                "rooms": self._rooms(s),
+                "rooms": rooms,
+                "routines": self._routines(rooms, loc),
+                "job": self._job(s, loc, rooms, prop),
+                "customizedCleaning": bool(safe(lambda: s.customized_cleaning, False)),
+                "cleanGenius": bool(safe(lambda: s.cleangenius_cleaning, False)),
                 "consumables": self._consumables(s, loc),
                 "map": {"path": str(map_path()), "serial": self.map_serial} if self.map_serial else None,
             }
@@ -465,6 +650,93 @@ class Vacuum:
                 }
             )
         return rooms[:64]
+
+    @staticmethod
+    def _job(s, loc, rooms, prop) -> dict:
+        """What the robot is doing right now, room by room, plus the dock."""
+
+        def name_of(key, fallback):
+            try:
+                return loc.data["entity"]["sensor"][key]["name"]
+            except (KeyError, TypeError):
+                return fallback
+
+        started = bool(safe(lambda: s.started, False))
+        running = bool(safe(lambda: s.running, False))
+        names = {r["id"]: r["name"] for r in rooms}
+        active = list(safe(lambda: s.active_segments) or [])[:64]
+        done = set(safe(lambda: s.completed_segments) or [])
+        skipped = set(safe(lambda: s.skipped_segments) or [])
+        current = safe(lambda: s.current_room.id) if safe(lambda: s.current_room) is not None else None
+        job_rooms = []
+        for rid in active:
+            if rid in done:
+                state = "done"
+            elif rid in skipped:
+                state = "skipped"
+            elif rid == current and running:
+                state = "current"
+            else:
+                state = "todo"
+            job_rooms.append({"id": int(rid), "name": names.get(rid, f"Room {rid}"), "state": state})
+
+        details = []
+
+        def add(key, label, value):
+            if value not in (None, "", "unknown"):
+                details.append({"key": key, "label": label, "value": str(value)[:64]})
+
+        wash = safe(lambda: s.self_wash_base_status_name)
+        if wash and wash not in ("unknown", "idle") and safe(lambda: s._capability.self_wash_base, False):
+            add("station", name_of("self_wash_base_status", "Station"), loc.state("sensor", "self_wash_base_status", wash))
+        drying = prop("DRYING_PROGRESS")
+        if safe(lambda: s.drying, False) and isinstance(drying, (int, float)):
+            add("drying", name_of("drying_progress", "Drying progress"), f"{int(drying)}%")
+        empty = safe(lambda: s.auto_empty_status_name)
+        if empty in ("active", "returning", "not_performed"):
+            add("empty", name_of("auto_empty_status", "Auto-empty"), loc.state("sensor", "auto_empty_status", empty))
+        charge = safe(lambda: s.charging_status_name)
+        if charge in ("charging", "return_to_charge", "charging_completed"):
+            add("charging", name_of("charging_status", "Charging"), loc.state("sensor", "charging_status", charge))
+
+        progress = prop("CLEANING_PROGRESS")
+        return {
+            "active": started,
+            "task": loc.state("sensor", "task_status", safe(lambda: s.task_status_name, "")) if started else "",
+            "progress": int(progress) if isinstance(progress, (int, float)) and started and 0 <= progress <= 100 else None,
+            "rooms": job_rooms,
+            "wholeHome": started and not active and not safe(lambda: s.zone_cleaning, False)
+            and not safe(lambda: s.spot_cleaning, False),
+            "resumesAfterCharge": bool(safe(lambda: s.cleaning_paused, False)),
+            "mopInstalled": safe(lambda: bool(s.water_tank_or_mop_installed)),
+            "details": details,
+            "totals": [
+                {"label": name_of("cleaning_count", "Cleanings"), "value": prop("CLEANING_COUNT"), "unit": ""},
+                {"label": name_of("total_cleaned_area", "Total area"), "value": prop("TOTAL_CLEANED_AREA"), "unit": "m²"},
+                {"label": name_of("total_cleaning_time", "Total time"), "value": prop("TOTAL_CLEANING_TIME"), "unit": "min"},
+            ],
+        }
+
+    @staticmethod
+    def _routines(rooms, loc) -> list:
+        out = []
+        names = {r["id"]: r["name"] for r in rooms}
+        for r in load_routines():
+            ids, missing = resolve_rooms(r["rooms"], rooms) if rooms else ([], [])
+            out.append(
+                {
+                    "id": r["id"],
+                    "name": r["name"],
+                    "rooms": [names[i] for i in ids],
+                    "missing": missing if rooms else [],
+                    "mode": r["mode"] or "",
+                    "modeLabel": loc.state("select", "cleaning_mode", r["mode"]) if r["mode"] else "",
+                    "suction": r["suction"] or "",
+                    "suctionLabel": loc.state("select", "suction_level", r["suction"]) if r["suction"] else "",
+                    "repeats": r["repeats"],
+                }
+            )
+        return out
 
     @staticmethod
     def _consumables(s, loc) -> list:
@@ -520,12 +792,62 @@ class Vacuum:
                     raise ValueError("give one or more room ids")
                 ids = [int(r) for r in rooms]
                 repeats = max(1, min(3, int(args.get("repeats") or 1)))
-                device.clean_segment(ids, repeats)
+                mode = str(args.get("mode") or "").lower()
+                suction = str(args.get("suction") or "").lower()
+                if mode and mode not in CLEANING_MODES:
+                    raise ValueError(f"mode must be one of: {', '.join(CLEANING_MODES)}")
+                if suction and suction not in SUCTION_LEVELS:
+                    raise ValueError(f"suction level must be one of: {', '.join(SUCTION_LEVELS)}")
+                self._clean(ids, mode, suction, repeats)
+            elif cmd == "routine":
+                self._run_routine(str(args.get("id", "")).lower())
             else:
                 raise ValueError(f"unknown command: {cmd}")
         device.schedule_update(1)
         self.notify()
         return {"command": cmd}
+
+    def _run_routine(self, rid: str):
+        device = self.device
+        routine = next((r for r in load_routines() if r["id"] == rid), None)
+        if routine is None:
+            raise ValueError(f"unknown routine: {rid}")
+        s = device.status
+        if s.running and not s.paused and not s.returning:
+            raise RuntimeError("busy")
+        ids, missing = resolve_rooms(routine["rooms"], self._rooms(s))
+        if missing:
+            raise ValueError("rooms_missing:" + ", ".join(missing))
+        if not ids:
+            raise ValueError("rooms_missing:" + ", ".join(map(str, routine["rooms"])))
+        self._clean(ids, routine["mode"], routine["suction"], routine["repeats"])
+        LOG.info("Started routine %s on rooms %s", rid, ids)
+
+    def _clean(self, ids: list, mode: str, suction: str, repeats: int):
+        """Clean rooms, first switching to the given mode and suction (empty: keep the robot's)."""
+        device, lib = self.device, self.lib
+        s = device.status
+        if s.running and not s.paused and not s.returning:
+            raise RuntimeError("busy")
+        if mode and safe(lambda: s.customized_cleaning, False):
+            raise RuntimeError("customized_cleaning")
+        if mode and safe(lambda: s.cleangenius_cleaning, False):
+            raise RuntimeError("cleangenius")
+        if safe(lambda: s.started, False):
+            # A paused or returning job would keep its own mode; end it first.
+            device.stop()
+            time.sleep(1)
+        if mode:
+            target = getattr(lib.DreameVacuumCleaningMode, mode.upper())
+            if safe(lambda: s.cleaning_mode) != target:
+                device.set_cleaning_mode(target.value)
+                time.sleep(1)
+        fan = None
+        if suction:
+            fan = getattr(lib.DreameVacuumSuctionLevel, suction.upper()).value
+            if safe(lambda: s.suction_level.value) != fan:
+                device.set_suction_level(fan)
+        device.clean_segment(ids, repeats, fan)
 
 
 class Handler(socketserver.StreamRequestHandler):
@@ -547,13 +869,16 @@ class Handler(socketserver.StreamRequestHandler):
             return self.watch(lang)
         if cmd == "status":
             return self.reply({"ok": True, "data": v.state(lang)})
+        if cmd == "notify":
+            v.set_notify(bool(args.get("enabled")), lang)
+            return self.reply({"ok": True, "data": {"notify": bool(args.get("enabled"))}})
         try:
             data = v.run(cmd, args)
             self.reply({"ok": True, "data": data})
         except Exception as ex:
-            key = getattr(ex, "key", None)
-            LOG.info("Command %s failed: %s", cmd, ex)
-            self.reply({"ok": False, "error": {"message": str(key or ex) or type(ex).__name__}})
+            message = locale_for(lang).error(ex)
+            LOG.info("Command %s failed: %s", cmd, message)
+            self.reply({"ok": False, "error": {"message": message}})
 
     def reply(self, doc):
         self.wfile.write((json.dumps(doc, ensure_ascii=False) + "\n").encode())
@@ -705,6 +1030,23 @@ def client(args) -> int:
         if cmd == "status":
             doc = call("status", lang=lang)
             return emit(out, doc, human_status(doc.get("data") or {}))
+        if cmd == "routines":
+            doc = call("status", lang=lang)
+            if doc.get("ok"):
+                doc = {"ok": True, "data": (doc.get("data") or {}).get("routines", [])}
+            return emit(
+                out,
+                doc,
+                "\n".join(
+                    f"{r['id']:<16} {r['name']}  ({', '.join(r['rooms'] or r['missing'])}"
+                    + (f"; {r['modeLabel']}" if r.get("modeLabel") else "")
+                    + (f"; {r['suctionLabel']}" if r.get("suctionLabel") else "")
+                    + ")"
+                    + (f"  MISSING: {', '.join(r['missing'])}" if r.get("missing") else "")
+                    for r in doc.get("data") or []
+                )
+                or f"No routines. Add them to {routines_path()}",
+            )
         if cmd == "rooms":
             doc = call("status", lang=lang)
             if doc.get("ok"):
@@ -714,7 +1056,11 @@ def client(args) -> int:
         if cmd == "suction":
             payload = {"level": args.level}
         elif cmd == "clean-rooms":
-            payload = {"rooms": args.rooms, "repeats": args.repeats}
+            payload = {"rooms": args.rooms, "repeats": args.repeats, "mode": args.mode, "suction": args.suction}
+        elif cmd == "routine":
+            payload = {"id": args.id}
+        elif cmd == "notify":
+            payload = {"enabled": args.state == "on"}
         doc = call(cmd, payload, lang=lang)
         return emit(out, doc, "ok")
     except ConnectionError as ex:
@@ -859,6 +1205,13 @@ def main(argv=None) -> int:
     cr = sub.add_parser("clean-rooms", help="clean the given rooms (ids from `rooms`)")
     cr.add_argument("rooms", nargs="+", type=int)
     cr.add_argument("--repeats", type=int, default=1, choices=(1, 2, 3))
+    cr.add_argument("--mode", choices=CLEANING_MODES, help="cleaning mode (default: the robot's current one)")
+    cr.add_argument("--suction", choices=SUCTION_LEVELS, help="suction level (default: the robot's current one)")
+    sub.add_parser("routines", help=f"list the routines from {routines_path()}")
+    ro = sub.add_parser("routine", help="run a routine by its id")
+    ro.add_argument("id")
+    no = sub.add_parser("notify", help="turn desktop notifications on or off (in --lang)")
+    no.add_argument("state", choices=("on", "off"))
 
     args = p.parse_args(argv)
     if args.command == "serve":

@@ -35,10 +35,13 @@ for f in i18n/*.json; do
   [[ -z $d ]] && pass "$f has the same keys as en.json" || fail "$f keys differ: $(echo "$d" | tr '\n' ' ')"
 done
 missing=""
-for key in $(grep -ohE 'tr\("[A-Za-z.]+"|tn\("[A-Za-z.]+"|"(error|state)\.[A-Za-z]+"' ./*.qml | grep -oE '[a-zA-Z]+\.[A-Za-z.]+' | sort -u); do
+for key in $(grep -ohE 'tr\("[A-Za-z.]+"|tn\("[A-Za-z.]+"|"(error|state)\.[A-Za-z]+"' ./*.qml | grep -oE '[a-zA-Z]+\.[A-Za-z.]+' | grep -v '\.$' | sort -u); do
   jq -e --arg k "$key" 'has($k)' i18n/en.json >/dev/null || missing="$missing $key"
 done
 [[ -z $missing ]] && pass "every key used in QML exists in en.json" || fail "keys missing from en.json:$missing"
+for state in done current todo skipped; do
+  jq -e --arg k "status.room.$state" 'has($k)' i18n/en.json >/dev/null || fail "missing status.room.$state"
+done
 
 section "Untrusted text"
 for f in ./*.qml; do
@@ -60,7 +63,7 @@ done
 if command -v shellcheck >/dev/null 2>&1; then
   shellcheck setup tests/check.sh && pass "shellcheck" || fail "shellcheck"
 fi
-python3 -m py_compile cli/dreame-vacuum.py tests/fake-dreame-vacuum 2>/dev/null \
+PYTHONDONTWRITEBYTECODE=1 PYTHONPYCACHEPREFIX="$(mktemp -d)" python3 -m py_compile cli/dreame-vacuum.py tests/fake-dreame-vacuum 2>/dev/null \
   && pass "python compiles" || fail "python does not compile"
 python3 -I cli/dreame-vacuum.py --help >/dev/null && pass "dreame-vacuum --help" || fail "dreame-vacuum --help"
 
@@ -70,11 +73,20 @@ XDG_RUNTIME_DIR=$(mktemp -d)
 fake=tests/fake-dreame-vacuum
 "$fake" --output json --lang en status | jq -e '.ok and .data.configured and (.data.rooms | length > 0) and (.data.suctionOptions | length == 4)' >/dev/null \
   && pass "status" || fail "status"
-"$fake" --output json start >/dev/null && "$fake" --output json status | jq -e '.data.running' >/dev/null \
+"$fake" --output json start >/dev/null && "$fake" --output json status | jq -e '.data.running and .data.job.active and (.data.job.rooms | length > 0)' >/dev/null \
   && pass "start" || fail "start"
 "$fake" --output json suction turbo >/dev/null && "$fake" --output json status | jq -e '.data.suction == "turbo"' >/dev/null \
   && pass "suction" || fail "suction"
 "$fake" --output json clean-rooms 2 --repeats 1 | jq -e '.ok' >/dev/null && pass "clean-rooms" || fail "clean-rooms"
+"$fake" --output json clean-rooms 2 --repeats 2 --mode sweeping --suction turbo | jq -e '.ok' >/dev/null && pass "clean-rooms with mode and suction" || fail "clean-rooms with mode and suction"
+out=$("$fake" --output json clean-rooms 2 --mode bogus || true)
+jq -e '.ok == false' <<<"$out" >/dev/null && pass "clean-rooms rejects an unknown mode" || fail "clean-rooms accepted an unknown mode"
+"$fake" --output json fake-reset >/dev/null
+"$fake" --output json routine living | jq -e '.ok' >/dev/null && "$fake" --output json status | jq -e '.data.running' >/dev/null \
+  && pass "routine" || fail "routine"
+{ "$fake" --output json routine nightzone || true; } | jq -e '.error.message == "busy"' >/dev/null && pass "routine refuses while busy" || fail "routine refuses while busy"
+{ "$fake" --output json routine garage || true; } | jq -e '.error.message | startswith("rooms_missing:")' >/dev/null \
+  && pass "routine with missing rooms" || fail "routine with missing rooms"
 "$fake" --output json suction loud >/dev/null && fail "accepts a bad suction level" || pass "rejects a bad suction level"
 first=$(FAKE_WATCH_INTERVAL=0.1 timeout 1 "$fake" --output json watch | head -1)
 jq -e '.data.activity' <<<"$first" >/dev/null && pass "watch" || fail "watch"

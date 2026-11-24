@@ -1,0 +1,16 @@
+{
+  "routines": [
+    {
+      "id": "living",
+      "name": "Living",
+      "rooms": ["Living Room"],
+      "mode": "mopping_after_sweeping"
+    },
+    {
+      "id": "nachtzone",
+      "name": "Slaapkamer, dressing, badkamer & gang",
+      "rooms": ["Primary Bedroom", "Closet", "Bathroom", "Corridor"],
+      "mode": "sweeping"
+    }
+  ]
+}

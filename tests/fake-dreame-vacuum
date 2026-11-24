@@ -60,6 +60,12 @@ def render(s):
         "suctionOptions": [{"value": v, "label": LABELS[v]} for v in LEVELS],
         "suctionAvailable": True, "cleaningMode": "sweeping_and_mopping",
         "cleaningModeLabel": "Sweeping and mopping",
+        "cleaningModeOptions": [
+            {"value": "sweeping", "label": "Sweeping"},
+            {"value": "mopping", "label": "Mopping"},
+            {"value": "sweeping_and_mopping", "label": "Sweeping and mopping"},
+            {"value": "mopping_after_sweeping", "label": "Mopping after sweeping"},
+        ],
         "cleanedArea": s["area"], "cleaningTime": s["minutes"], "cleaningProgress": None,
         "currentRoom": s["room"] if running else "",
         "rooms": [
@@ -69,6 +75,33 @@ def render(s):
             {"id": 4, "name": "Bedroom", "order": 4},
             {"id": 5, "name": "<b>Office</b>", "order": 5},
         ],
+        "routines": [
+            {"id": "living", "name": "Living", "rooms": ["Living room"], "missing": [],
+             "mode": "mopping_after_sweeping", "modeLabel": "Mopping after sweeping",
+             "suction": "", "suctionLabel": "", "repeats": 1},
+            {"id": "nightzone", "name": "Bedroom, hallway & <i>bath</i>", "rooms": ["Bedroom", "Hallway"],
+             "missing": [], "mode": "sweeping", "modeLabel": "Sweeping",
+             "suction": "strong", "suctionLabel": "Strong", "repeats": 2},
+            {"id": "garage", "name": "Garage", "rooms": [], "missing": ["Garage"],
+             "mode": "sweeping", "modeLabel": "Sweeping", "suction": "", "suctionLabel": "", "repeats": 1},
+        ],
+        "job": {
+            "active": running, "task": label if running else "", "progress": 40 if running else None,
+            "rooms": [
+                {"id": 1, "name": "Living room", "state": "done"},
+                {"id": 2, "name": "Kitchen", "state": "current" if a == "cleaning" else "todo"},
+                {"id": 3, "name": "Hallway", "state": "todo"},
+            ] if running else [],
+            "wholeHome": False, "resumesAfterCharge": False, "mopInstalled": True,
+            "details": [{"key": "station", "label": "Self-Wash Base Status", "value": "Washing"}] if running else [],
+            "totals": [
+                {"label": "Cleaning Count", "value": 154, "unit": ""},
+                {"label": "Total Cleaned Area", "value": 4028, "unit": "m²"},
+                {"label": "Total Cleaning Time", "value": 4353, "unit": "min"},
+            ],
+        },
+        "customizedCleaning": False,
+        "cleanGenius": False,
         "consumables": [
             {"key": "main_brush", "label": "Main brush", "percent": 64},
             {"key": "side_brush", "label": "Side brush", "percent": 41},
@@ -117,7 +150,7 @@ def main(argv):
         s.update(activity="docked" if s["activity"] == "docked" else "returning")
     elif cmd == "dock":
         s["activity"] = "returning"
-    elif cmd == "locate":
+    elif cmd in ("locate", "notify"):
         pass
     elif cmd == "suction":
         if not rest or rest[0] not in LEVELS:
@@ -126,11 +159,31 @@ def main(argv):
         s["suction"] = rest[0]
     elif cmd == "clean-rooms":
         ids = [r for r in rest if r.isdigit()]
+        for flag, allowed in (("--mode", ("sweeping", "mopping", "sweeping_and_mopping", "mopping_after_sweeping")), ("--suction", LEVELS)):
+            if flag in rest:
+                at = rest.index(flag)
+                if at + 1 >= len(rest) or rest[at + 1] not in allowed:
+                    out({"ok": False, "error": {"message": f"bad {flag[2:]}"}})
+                    return 1
+                if flag == "--suction":
+                    s["suction"] = rest[at + 1]
         if not ids:
             out({"ok": False, "error": {"message": "give one or more room ids"}})
             return 1
         names = {r["id"]: r["name"] for r in render(s)["rooms"]}
         s.update(activity="cleaning", room=names.get(int(ids[0]), ""), area=0, minutes=0)
+    elif cmd == "routine":
+        r = next((x for x in render(s)["routines"] if rest and x["id"] == rest[0]), None)
+        if r is None:
+            out({"ok": False, "error": {"message": "unknown routine"}})
+            return 1
+        if r["missing"]:
+            out({"ok": False, "error": {"message": "rooms_missing:" + ", ".join(r["missing"])}})
+            return 1
+        if s["activity"] == "cleaning":
+            out({"ok": False, "error": {"message": "busy"}})
+            return 1
+        s.update(activity="cleaning", room=r["rooms"][0], area=0, minutes=0)
     elif cmd == "fake-error":
         s["error"] = "The main brush is tangled"
     elif cmd == "fake-reset":

@@ -2,14 +2,23 @@
   "schemaVersion": 1,
   "id": "io.github.opteon-sdc.dreame",
   "name": "Dreame Vacuum",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "opteon-sdc",
   "license": "MIT",
-  "description": "Start, pause, dock and locate your Dreame robot vacuum, pick the suction level, clean single rooms and watch the live map from the Omarchy bar. Built on Tasshack's dreame-vacuum library.",
+  "description": "Start, pause, dock and locate your Dreame robot vacuum, pick the suction level, run cleaning routines, clean single rooms and watch the live map from the Omarchy bar. Built on Tasshack's dreame-vacuum library.",
   "homepage": "https://github.com/opteon-sdc/omarchy-dreame-vacuum",
   "repository": "https://github.com/opteon-sdc/omarchy-dreame-vacuum",
-  "keywords": ["dreame", "mova", "robot-vacuum", "vacuum", "smart-home", "dreamehome"],
-  "kinds": ["bar-widget"],
+  "keywords": [
+    "dreame",
+    "mova",
+    "robot-vacuum",
+    "vacuum",
+    "smart-home",
+    "dreamehome"
+  ],
+  "kinds": [
+    "bar-widget"
+  ],
   "entryPoints": {
     "barWidget": "Panel.qml"
   },
@@ -24,16 +33,35 @@
       "notify": true,
       "showMap": true,
       "panelWidth": 420,
-      "cliPath": ""
+      "cliPath": "",
+      "defaultTab": "status"
     },
     "schema": [
       {
         "key": "barLabel",
         "type": "enum",
         "label": "Battery on the bar",
-        "options": ["cleaning", "always", "never"],
+        "options": [
+          "cleaning",
+          "always",
+          "never"
+        ],
         "defaultValue": "cleaning",
         "description": "Show the battery level next to the bar icon while cleaning, always, or never."
+      },
+      {
+        "key": "defaultTab",
+        "type": "enum",
+        "label": "Default tab",
+        "options": [
+          "status",
+          "routines",
+          "rooms",
+          "map",
+          "care"
+        ],
+        "defaultValue": "status",
+        "description": "The tab the panel opens on; the last one you picked is kept until the shell restarts."
       },
       {
         "key": "notify",
@@ -66,6 +94,12 @@
         "defaultValue": ""
       }
     ],
-    "aliases": ["vacuum", "robot", "dreame", "stofzuiger", "cleaning"]
+    "aliases": [
+      "vacuum",
+      "robot",
+      "dreame",
+      "stofzuiger",
+      "cleaning"
+    ]
   }
 }

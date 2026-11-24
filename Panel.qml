@@ -17,10 +17,11 @@ Panel {
   readonly property color urgent: bar ? bar.urgent : Color.urgent
   readonly property color dim: Qt.darker(foreground, 1.45)
   readonly property color accentColor: Color.accent
+  // Resolved here: inside an inline component `Color` does not reach the qs.Commons singleton.
+  readonly property color panelBackground: Color.background
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
 
   readonly property string barLabel: String(setting("barLabel", "cleaning"))
-  readonly property bool notify: setting("notify", true) === true
   readonly property bool showMap: setting("showMap", true) === true
   readonly property int panelWidth: Math.max(340, Math.min(800, Number(setting("panelWidth", 420)) || 420))
 
@@ -34,15 +35,68 @@ Panel {
   readonly property string glyphRefresh: String.fromCodePoint(0xF0450)  // nf-md-refresh
   readonly property string glyphChecked: String.fromCodePoint(0xF0132)  // nf-md-checkbox_marked
   readonly property string glyphUnchecked: String.fromCodePoint(0xF0131) // nf-md-checkbox_blank_outline
+  readonly property string glyphFan: String.fromCodePoint(0xF0210)      // nf-md-fan
+  readonly property string glyphWater: String.fromCodePoint(0xF058C)    // nf-md-water
+  readonly property string glyphThen: String.fromCodePoint(0xF0054)     // nf-md-arrow_right
+
+  // Glyphs that say what a routine does: vacuum, mop, both, or mop after vacuuming.
+  function modeGlyphs(mode) {
+    if (mode === "sweeping") return glyphFan
+    if (mode === "mopping") return glyphWater
+    if (mode === "sweeping_and_mopping") return glyphFan + " " + glyphWater
+    if (mode === "mopping_after_sweeping") return glyphFan + " " + glyphThen + " " + glyphWater
+    return glyphRobot
+  }
 
   readonly property var st: svc.vac
   readonly property bool online: svc.online
   readonly property bool busy: st.running === true && st.paused !== true && st.returning !== true
-  readonly property bool alerting: online && (st.hasError === true || st.hasWarning === true)
+  // Only real errors are red; warnings (e.g. "clean the washboard") are reminders.
+  readonly property bool alerting: online && st.hasError === true
+  readonly property bool noticing: online && st.hasError !== true && st.hasWarning === true
+  readonly property string glyphInfo: String.fromCodePoint(0xF02FD)        // nf-md-information_outline
+
+  readonly property string glyphTabStatus: String.fromCodePoint(0xF0150)   // nf-md-clock_outline
+  readonly property string glyphDone: String.fromCodePoint(0xF05E0)        // nf-md-check_circle
+  readonly property string glyphTodo: String.fromCodePoint(0xF0766)        // nf-md-circle_outline
+  readonly property string glyphSkipped: String.fromCodePoint(0xF04AD)     // nf-md-skip_next
+  readonly property string glyphTabRoutines: String.fromCodePoint(0xF0411) // nf-md-playlist_play
+  readonly property string glyphTabRooms: String.fromCodePoint(0xF0821)    // nf-md-floor_plan
+  readonly property string glyphTabMap: String.fromCodePoint(0xF034D)      // nf-md-map
+  readonly property string glyphTabCare: String.fromCodePoint(0xF05B7)     // nf-md-wrench
+  readonly property string glyphZoomIn: String.fromCodePoint(0xF0349)      // nf-md-magnify_plus
+  readonly property string glyphZoomOut: String.fromCodePoint(0xF034A)     // nf-md-magnify_minus
+  readonly property string glyphFit: String.fromCodePoint(0xF0044)         // nf-md-arrow_collapse_all
+
+  // Tabs with something to show; the last one picked is kept while the shell runs.
+  property string tab: String(setting("defaultTab", "status"))
+  readonly property var tabs: {
+    var out = [{ value: "status", label: tr("section.status", "Status"), icon: glyphTabStatus }]
+    if (svc.routines.length > 0) out.push({ value: "routines", label: tr("section.routines", "Routines"), icon: glyphTabRoutines })
+    if (svc.rooms.length > 0) out.push({ value: "rooms", label: tr("section.rooms", "Rooms"), icon: glyphTabRooms })
+    if (showMap && (st.mapPath || "") !== "") out.push({ value: "map", label: tr("section.map", "Map"), icon: glyphTabMap })
+    if (svc.consumables.length > 0) out.push({ value: "care", label: tr("section.maintenance", "Maintenance"), icon: glyphTabCare })
+    return out
+  }
+  readonly property string currentTab: {
+    for (var i = 0; i < tabs.length; i++) if (tabs[i].value === tab) return tab
+    return tabs.length > 0 ? tabs[0].value : ""
+  }
+  function cycleTab(step) {
+    if (tabs.length < 2) return
+    var at = 0
+    for (var i = 0; i < tabs.length; i++) if (tabs[i].value === currentTab) at = i
+    tab = tabs[(at + step + tabs.length) % tabs.length].value
+  }
 
   // Room ids picked in the panel for a room clean.
   property var selectedRooms: []
   property int repeats: 1
+  // Mode and suction for that clean; empty means "what the robot is set to now".
+  property string pickMode: ""
+  property string pickSuction: ""
+  readonly property string roomMode: pickMode || st.cleaningMode || ""
+  readonly property string roomSuction: pickSuction || st.suction || ""
 
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
@@ -51,29 +105,6 @@ Panel {
     id: svc
     settings: root.settings
     language: Commons.I18n.language || "en"
-    onUpdated: function (previous, next) { root.announce(previous, next) }
-  }
-
-  // ---- notifications
-
-  function announce(previous, next) {
-    if (!notify || !previous || previous.activity === undefined || next.activity === undefined) return
-    var name = next.name || "Dreame"
-    if (next.hasError && !previous.hasError) {
-      send(name, next.errorLabel || next.statusLabel, "critical")
-      return
-    }
-    var wasCleaning = previous.running === true || previous.returning === true
-    var home = next.docked === true || next.charging === true
-    if (wasCleaning && home && !next.running) {
-      send(name, tr("notify.finished", "Cleaning finished: %1 m² in %2 min")
-        .arg(Commons.I18n.formatNumber(previous.cleanedArea || 0))
-        .arg(Commons.I18n.formatNumber(previous.cleaningTime || 0)), "normal")
-    }
-  }
-
-  function send(title, body, urgency) {
-    Quickshell.execDetached(["notify-send", "--app-name=Dreame", "--icon=robot-vacuum", "--urgency=" + urgency, String(title), String(body)])
   }
 
   // ---- actions
@@ -88,8 +119,10 @@ Panel {
 
   function cleanSelected() {
     if (selectedRooms.length === 0) return
-    svc.cleanRooms(selectedRooms, repeats)
+    svc.cleanRooms(selectedRooms, repeats, roomMode, roomMode === "mopping" ? "" : roomSuction)
     selectedRooms = []
+    pickMode = ""
+    pickSuction = ""
   }
 
   function login() {
@@ -107,8 +140,13 @@ Panel {
       "cli_missing": "error.cli",
       "not_configured": "error.notConfigured",
       "auth_failed": "error.auth",
-      "not_connected": "error.notConnected"
+      "not_connected": "error.notConnected",
+      "busy": "error.busy",
+      "customized_cleaning": "error.customizedCleaning",
+      "cleangenius": "error.cleanGenius"
     }
+    if (s.indexOf("rooms_missing:") === 0)
+      return tr("error.roomsMissing", "Not on the map: %1").arg(s.slice(14))
     return known[s] ? tr(known[s], s) : s
   }
 
@@ -126,6 +164,7 @@ Panel {
     function stop(): void { svc.stop() }
     function dock(): void { svc.dock() }
     function locate(): void { svc.locate() }
+    function routine(id: string): void { svc.runRoutine(id) }
   }
 
   onOpenedChanged: if (opened) Qt.callLater(function () { keyCatcher.forceActiveFocus() })
@@ -174,17 +213,20 @@ Panel {
       anchors.fill: parent
       onCloseRequested: root.close()
       onTabRequested: function (direction) { root.switchPanel(direction) }
+      onMoveRequested: function (dx, dy) { if (dx !== 0) root.cycleTab(dx) }
       onActivateRequested: if (root.online) svc.toggle()
       onTextKey: function (t) {
         if (!root.online) return
         var key = String(t).toLowerCase()
-        var options = st.suctionOptions || []
-        var level = options[Number(key) - 1]
+        var routine = (st.routines || [])[Number(key) - 1]
         if (key === " " || key === "p") svc.toggle()
         else if (key === "s") svc.stop()
         else if (key === "h" || key === "d") svc.dock()
         else if (key === "l") svc.locate()
-        else if (key >= "1" && key <= "4" && level && st.suctionAvailable) svc.setSuction(level.value)
+        else if (root.currentTab === "map" && (key === "+" || key === "=")) mapBox.zoomBy(1.5)
+        else if (root.currentTab === "map" && key === "-") mapBox.zoomBy(1 / 1.5)
+        else if (root.currentTab === "map" && key === "0") mapBox.reset()
+        else if (key >= "1" && key <= "9" && routine && routine.missing.length === 0) svc.runRoutine(routine.id)
       }
 
       Flickable {
@@ -291,23 +333,33 @@ Panel {
 
           // ---------- Problem banner ----------
           Rectangle {
-            visible: root.alerting && (st.errorLabel || "") !== ""
+            readonly property color tone: root.alerting ? root.urgent : root.foreground
+            visible: (root.alerting || root.noticing) && (st.errorLabel || "") !== ""
             width: parent.width
             implicitHeight: bannerText.implicitHeight + Style.space(16)
             radius: Style.space(6)
-            color: Qt.rgba(root.urgent.r, root.urgent.g, root.urgent.b, 0.15)
+            color: Qt.rgba(tone.r, tone.g, tone.b, root.alerting ? 0.15 : 0.06)
             border.width: 1
-            border.color: Qt.rgba(root.urgent.r, root.urgent.g, root.urgent.b, 0.5)
+            border.color: Qt.rgba(tone.r, tone.g, tone.b, root.alerting ? 0.5 : 0.18)
 
             Label {
               id: bannerText
               anchors.fill: parent
               anchors.margins: Style.space(8)
-              text: root.glyphAlert + "  " + (st.errorLabel || "")
-              color: root.urgent
+              text: (root.alerting ? root.glyphAlert : root.glyphInfo) + "  " + (st.errorLabel || "")
+              color: root.alerting ? root.urgent : root.dim
               font.pixelSize: Style.font.bodySmall
               wrapMode: Text.WordWrap
             }
+          }
+
+          Label {
+            visible: svc.commandError !== "" && root.online
+            width: parent.width
+            text: root.glyphAlert + "  " + root.message(svc.commandError)
+            color: root.urgent
+            font.pixelSize: Style.font.bodySmall
+            wrapMode: Text.WordWrap
           }
 
           // ---------- Setup / offline ----------
@@ -421,54 +473,240 @@ Panel {
             }
           }
 
-          // ---------- Current job ----------
-          Column {
-            visible: root.online && (st.running === true || st.paused === true)
-            width: parent.width
-            spacing: Style.spacing.labelGap
-            InfoPair { label: root.tr("info.area", "Cleaned"); value: Commons.I18n.formatNumber(st.cleanedArea || 0) + " m²" }
-            InfoPair { label: root.tr("info.time", "Time"); value: Commons.I18n.formatNumber(st.cleaningTime || 0) + " min" }
-            InfoPair { visible: (st.cleaningModeLabel || "") !== ""; label: root.tr("info.mode", "Mode"); value: st.cleaningModeLabel || "" }
+          // ---------- Tabs ----------
+          PanelSeparator { visible: root.online && root.tabs.length > 0; foreground: root.foreground }
+
+          // Measures the tabs as text; when they do not fit, show icons with tooltips.
+          ButtonGroup {
+            id: tabMeasure
+            visible: false
+            options: root.tabs.map(function (t) { return { value: t.value, label: t.label } })
+            fontFamily: root.fontFamily
+            fontSize: Style.font.bodySmall
           }
 
-          // ---------- Suction ----------
-          Column {
-            visible: root.online && (st.suctionOptions || []).length > 0
+          ButtonGroup {
+            readonly property bool fits: tabMeasure.implicitWidth <= width
+            visible: root.online && root.tabs.length > 1
             width: parent.width
-            spacing: Style.space(10)
+            options: root.tabs.map(function (t) {
+              return fits ? { value: t.value, label: t.label } : { value: t.value, label: "", icon: t.icon, tooltip: t.label }
+            })
+            value: root.currentTab
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            fontSize: Style.font.bodySmall
+            focusable: false
+            onChanged: function (v) { root.tab = v }
+          }
 
-            PanelSeparator { foreground: root.foreground }
-            PanelSectionHeader {
-              text: root.tr("section.suction", "Suction")
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-            }
-            ButtonGroup {
+          // Status: the job in progress, room by room, and the dock.
+          Column {
+            readonly property var job: st.job || ({})
+            visible: root.online && root.currentTab === "status"
+            width: parent.width
+            spacing: Style.space(12)
+
+            Label {
+              visible: !parent.job.active
               width: parent.width
-              options: st.suctionOptions || []
-              value: st.suction || ""
-              enabled: st.suctionAvailable !== false
-              opacity: enabled ? 1 : 0.45
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-              fontSize: Style.font.bodySmall
-              focusable: false
-              onChanged: function (v) { svc.setSuction(v) }
+              text: st.docked ? root.tr("status.idleDocked", "No job running. The robot is in its dock.") : root.tr("status.idle", "No job running.")
+              color: root.dim
+              font.pixelSize: Style.font.bodySmall
+              wrapMode: Text.WordWrap
+            }
+
+            // Task and progress
+            Column {
+              visible: parent.job.active === true
+              width: parent.width
+              spacing: Style.space(6)
+
+              Item {
+                width: parent.width
+                implicitHeight: Math.max(taskText.implicitHeight, progressText.implicitHeight)
+                Label {
+                  id: taskText
+                  anchors.left: parent.left
+                  anchors.right: progressText.left
+                  anchors.rightMargin: Style.space(8)
+                  elide: Text.ElideRight
+                  text: (st.job && st.job.task) || st.statusLabel || ""
+                  font.pixelSize: Style.font.body
+                  font.bold: true
+                }
+                Label {
+                  id: progressText
+                  anchors.right: parent.right
+                  visible: st.job && st.job.progress >= 0
+                  text: Commons.I18n.formatNumber(st.job ? st.job.progress : 0) + "%"
+                  font.pixelSize: Style.font.body
+                  font.bold: true
+                }
+              }
+
+              Item {
+                visible: st.job && st.job.progress >= 0
+                width: parent.width
+                implicitHeight: Style.space(6)
+                Rectangle {
+                  id: jobTrack
+                  anchors.fill: parent
+                  radius: height / 2
+                  color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.12)
+                }
+                Rectangle {
+                  height: jobTrack.height
+                  radius: jobTrack.radius
+                  color: root.accentColor
+                  width: Math.max(jobTrack.height, jobTrack.width * Math.max(0, st.job ? st.job.progress : 0) / 100)
+                  Behavior on width { NumberAnimation { duration: Style.duration(320); easing.type: Easing.OutCubic } }
+                }
+              }
+
+              Label {
+                visible: st.job && st.job.resumesAfterCharge === true
+                width: parent.width
+                text: root.tr("status.resumes", "Charging; cleaning resumes on its own once the battery is charged.")
+                color: root.dim
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WordWrap
+              }
+            }
+
+            // Numbers for this job
+            Column {
+              visible: parent.job.active === true
+              width: parent.width
+              spacing: Style.spacing.labelGap
+              InfoPair { label: root.tr("info.area", "Cleaned"); value: Commons.I18n.formatNumber(st.cleanedArea || 0) + " m²" }
+              InfoPair { label: root.tr("info.time", "Time"); value: Commons.I18n.formatNumber(st.cleaningTime || 0) + " min" }
+              InfoPair { visible: (st.cleaningModeLabel || "") !== ""; label: root.tr("info.mode", "Mode"); value: st.cleaningModeLabel || "" }
+              InfoPair { visible: (st.suctionLabel || "") !== ""; label: root.tr("section.suction", "Suction"); value: st.suctionLabel || "" }
+              InfoPair {
+                visible: st.job && st.job.mopInstalled !== null
+                label: root.tr("status.mop", "Mop pads")
+                value: st.job && st.job.mopInstalled ? root.tr("status.mopOn", "Attached") : root.tr("status.mopOff", "Not attached")
+              }
+              Repeater {
+                model: st.job ? st.job.details : []
+                InfoPair {
+                  required property var modelData
+                  label: modelData.label
+                  value: modelData.value
+                }
+              }
+            }
+
+            // Rooms in this job
+            Column {
+              visible: parent.job.active === true && ((st.job.rooms || []).length > 0 || st.job.wholeHome)
+              width: parent.width
+              spacing: Style.space(6)
+
+              PanelSectionHeader {
+                text: root.tr("status.rooms", "Rooms in this job")
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+              }
+              Label {
+                visible: st.job && st.job.wholeHome && (st.job.rooms || []).length === 0
+                text: root.tr("status.wholeHome", "Whole home")
+                font.pixelSize: Style.font.bodySmall
+              }
+              Repeater {
+                model: st.job ? st.job.rooms : []
+                Item {
+                  required property var modelData
+                  width: parent.width
+                  implicitHeight: roomName.implicitHeight
+                  readonly property bool isCurrent: modelData.state === "current"
+
+                  Label {
+                    id: roomIcon
+                    anchors.left: parent.left
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: Style.space(20)
+                    text: modelData.state === "done" ? root.glyphDone
+                      : modelData.state === "current" ? root.glyphRobot
+                      : modelData.state === "skipped" ? root.glyphSkipped : root.glyphTodo
+                    color: parent.isCurrent ? root.accentColor : (modelData.state === "todo" ? root.dim : root.foreground)
+                    font.pixelSize: Style.font.bodySmall
+                    SequentialAnimation on opacity {
+                      running: parent.isCurrent && root.opened && !Style.reduceMotion
+                      loops: Animation.Infinite
+                      alwaysRunToEnd: true
+                      NumberAnimation { from: 1.0; to: 0.4; duration: Style.duration(900); easing.type: Easing.InOutSine }
+                      NumberAnimation { from: 0.4; to: 1.0; duration: Style.duration(900); easing.type: Easing.InOutSine }
+                    }
+                  }
+                  Label {
+                    id: roomName
+                    anchors.left: roomIcon.right
+                    anchors.right: roomState.left
+                    anchors.rightMargin: Style.space(8)
+                    elide: Text.ElideRight
+                    text: modelData.name
+                    font.pixelSize: Style.font.bodySmall
+                    font.bold: parent.isCurrent
+                    color: modelData.state === "todo" ? root.dim : root.foreground
+                  }
+                  Label {
+                    id: roomState
+                    anchors.right: parent.right
+                    text: root.tr("status.room." + modelData.state, modelData.state)
+                    color: parent.isCurrent ? root.accentColor : root.dim
+                    font.pixelSize: Style.font.caption
+                  }
+                }
+              }
+            }
+
+            // Lifetime
+            Column {
+              visible: (st.job && st.job.totals || []).length > 0
+              width: parent.width
+              spacing: Style.spacing.labelGap
+
+              PanelSectionHeader {
+                text: root.tr("status.totals", "All time")
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+              }
+              Item { width: 1; height: Style.space(2) }
+              Repeater {
+                model: st.job ? st.job.totals : []
+                InfoPair {
+                  required property var modelData
+                  label: modelData.label
+                  value: Commons.I18n.formatNumber(modelData.value) + (modelData.unit ? " " + modelData.unit : "")
+                }
+              }
             }
           }
 
-          // ---------- Rooms ----------
+          // Routines
           Column {
-            visible: root.online && svc.rooms.length > 0
+            visible: root.online && root.currentTab === "routines"
+            width: parent.width
+            spacing: Style.space(8)
+
+            Repeater {
+              model: st.routines || []
+              RoutineCard {
+                required property var modelData
+                required property int index
+                routine: modelData
+                shortcut: index < 9 ? String(index + 1) : ""
+              }
+            }
+          }
+
+          // Rooms
+          Column {
+            visible: root.online && root.currentTab === "rooms"
             width: parent.width
             spacing: Style.space(10)
-
-            PanelSeparator { foreground: root.foreground }
-            PanelSectionHeader {
-              text: root.tr("section.rooms", "Rooms")
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-            }
 
             Flow {
               width: parent.width
@@ -488,6 +726,58 @@ Panel {
                   active: (st.currentRoom || "") === modelData.name && st.running === true
                   onClicked: root.toggleRoom(modelData.id)
                 }
+              }
+            }
+
+            // How to clean the picked rooms.
+            Column {
+              visible: root.selectedRooms.length > 0 && (st.cleaningModeOptions || []).length > 0
+              width: parent.width
+              spacing: Style.space(6)
+              PanelSectionHeader {
+                text: root.tr("info.mode", "Mode")
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+              }
+              Flow {
+                width: parent.width
+                spacing: Style.space(6)
+                Repeater {
+                  model: st.cleaningModeOptions || []
+                  Button {
+                    required property var modelData
+                    iconText: root.modeGlyphs(modelData.value)
+                    text: modelData.label
+                    fontSize: Style.font.bodySmall
+                    foreground: root.foreground
+                    fontFamily: root.fontFamily
+                    bordered: true
+                    selected: root.roomMode === modelData.value
+                    onClicked: root.pickMode = modelData.value
+                  }
+                }
+              }
+            }
+
+            Column {
+              visible: root.selectedRooms.length > 0 && root.roomMode !== "mopping"
+                && st.suctionAvailable !== false && (st.suctionOptions || []).length > 0
+              width: parent.width
+              spacing: Style.space(6)
+              PanelSectionHeader {
+                text: root.tr("section.suction", "Suction")
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+              }
+              ButtonGroup {
+                width: parent.width
+                options: st.suctionOptions || []
+                value: root.roomSuction
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                fontSize: Style.font.bodySmall
+                focusable: false
+                onChanged: function (v) { root.pickSuction = v }
               }
             }
 
@@ -519,13 +809,17 @@ Panel {
             }
           }
 
-          // ---------- Map ----------
-          // Two images take turns: a new render loads into the hidden one and
-          // replaces the shown one only once it is fully decoded, so the map never blinks.
+          // Map: wheel or pinch to zoom around the pointer, drag to pan,
+          // double-click to zoom in or back out. Two images take turns so a
+          // new render replaces the old one only once it is decoded: no blinking,
+          // and the zoom and position stay put while the robot moves.
           Item {
             id: mapBox
             property bool showA: true
             property bool hasFrame: false
+            property real zoom: 1
+            property real pinchBase: 1
+            readonly property real maxZoom: 4
             readonly property Image front: showA ? mapA : mapB
             readonly property Image back: showA ? mapB : mapA
             // A new query string makes the Image read the re-rendered file.
@@ -542,55 +836,132 @@ Panel {
               showA = !showA
               hasFrame = true
             }
+            // Zoom so the map point under (x, y) stays under (x, y).
+            function zoomAt(z, x, y) {
+              z = Math.max(1, Math.min(maxZoom, z))
+              if (Math.abs(z - zoom) < 0.001) return
+              var cx = (mapFlick.contentX + x) / zoom
+              var cy = (mapFlick.contentY + y) / zoom
+              zoom = z
+              mapFlick.contentX = Math.max(0, Math.min(width * z - width, cx * z - x))
+              mapFlick.contentY = Math.max(0, Math.min(height * z - height, cy * z - y))
+            }
+            function zoomBy(factor) { zoomAt(zoom * factor, width / 2, height / 2) }
+            function reset() { zoomAt(1, width / 2, height / 2) }
+
             onUrlChanged: load()
             Component.onCompleted: load()
 
-            visible: root.showMap && root.online && hasFrame
+            visible: root.online && root.currentTab === "map"
             width: parent.width
-            implicitHeight: visible ? Math.min(width, width * aspect) : 0
-            Behavior on implicitHeight {
-              enabled: mapBox.hasFrame
-              NumberAnimation { duration: Style.duration(180); easing.type: Easing.OutCubic }
+            implicitHeight: hasFrame ? Math.min(width * aspect, Style.space(560)) : Style.space(120)
+
+            Label {
+              anchors.centerIn: parent
+              visible: !mapBox.hasFrame
+              text: root.tr("state.loadingMap", "Loading the map…")
+              color: root.dim
+              font.pixelSize: Style.font.bodySmall
             }
 
-            Image {
-              id: mapA
+            Flickable {
+              id: mapFlick
               anchors.fill: parent
-              asynchronous: true
-              cache: false
-              smooth: true
-              mipmap: true
-              fillMode: Image.PreserveAspectFit
-              visible: mapBox.showA
-              onStatusChanged: mapBox.swapIfReady(mapA)
+              clip: true
+              contentWidth: width * mapBox.zoom
+              contentHeight: height * mapBox.zoom
+              interactive: mapBox.zoom > 1
+              boundsBehavior: Flickable.StopAtBounds
+
+              Item {
+                width: mapFlick.contentWidth
+                height: mapFlick.contentHeight
+
+                Image {
+                  id: mapA
+                  anchors.fill: parent
+                  asynchronous: true
+                  cache: false
+                  smooth: true
+                  mipmap: true
+                  fillMode: Image.PreserveAspectFit
+                  visible: mapBox.showA
+                  onStatusChanged: mapBox.swapIfReady(mapA)
+                }
+                Image {
+                  id: mapB
+                  anchors.fill: parent
+                  asynchronous: true
+                  cache: false
+                  smooth: true
+                  mipmap: true
+                  fillMode: Image.PreserveAspectFit
+                  visible: !mapBox.showA
+                  onStatusChanged: mapBox.swapIfReady(mapB)
+                }
+              }
             }
-            Image {
-              id: mapB
-              anchors.fill: parent
-              asynchronous: true
-              cache: false
-              smooth: true
-              mipmap: true
-              fillMode: Image.PreserveAspectFit
-              visible: !mapBox.showA
-              onStatusChanged: mapBox.swapIfReady(mapB)
+
+            WheelHandler {
+              target: null
+              acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
+              onWheel: function (event) {
+                var steps = event.angleDelta.y / 120
+                if (steps === 0) return
+                mapBox.zoomAt(mapBox.zoom * Math.pow(1.2, steps), point.position.x, point.position.y)
+              }
+            }
+
+            PinchHandler {
+              target: null
+              onActiveChanged: if (active) mapBox.pinchBase = mapBox.zoom
+              onActiveScaleChanged: mapBox.zoomAt(mapBox.pinchBase * activeScale, centroid.position.x, centroid.position.y)
+            }
+
+            TapHandler {
+              onDoubleTapped: function (eventPoint) {
+                if (mapBox.zoom > 1.01) mapBox.reset()
+                else mapBox.zoomAt(2.5, eventPoint.position.x, eventPoint.position.y)
+              }
+            }
+
+            Column {
+              visible: mapBox.hasFrame
+              anchors.top: parent.top
+              anchors.right: parent.right
+              anchors.margins: Style.space(6)
+              spacing: Style.space(4)
+
+              MapButton { glyph: root.glyphZoomIn; tip: root.tr("map.zoomIn", "Zoom in (+)"); onClicked: mapBox.zoomBy(1.5) }
+              MapButton { glyph: root.glyphZoomOut; tip: root.tr("map.zoomOut", "Zoom out (−)"); enabled: mapBox.zoom > 1; onClicked: mapBox.zoomBy(1 / 1.5) }
+              MapButton { glyph: root.glyphFit; tip: root.tr("map.fit", "Whole map (0)"); enabled: mapBox.zoom > 1; onClicked: mapBox.reset() }
+            }
+
+            Rectangle {
+              visible: mapBox.zoom > 1.01
+              anchors.left: parent.left
+              anchors.bottom: parent.bottom
+              anchors.margins: Style.space(6)
+              width: zoomText.implicitWidth + Style.space(12)
+              height: zoomText.implicitHeight + Style.space(6)
+              radius: height / 2
+              color: Qt.rgba(root.panelBackground.r, root.panelBackground.g, root.panelBackground.b, 0.85)
+
+              Label {
+                id: zoomText
+                anchors.centerIn: parent
+                text: Commons.I18n.formatNumber(Math.round(mapBox.zoom * 10) / 10, 1) + "×"
+                font.pixelSize: Style.font.caption
+              }
             }
           }
 
-          // ---------- Consumables ----------
+          // Maintenance
           Column {
-            visible: root.online && svc.consumables.length > 0
+            visible: root.online && root.currentTab === "care"
             width: parent.width
             spacing: Style.spacing.labelGap
 
-            PanelSeparator { foreground: root.foreground }
-            Item { width: 1; height: Style.space(4) }
-            PanelSectionHeader {
-              text: root.tr("section.maintenance", "Maintenance")
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-            }
-            Item { width: 1; height: Style.space(4) }
             Repeater {
               model: st.consumables || []
               InfoPair {
@@ -601,17 +972,111 @@ Panel {
               }
             }
           }
-
-          Label {
-            visible: svc.lastError !== "" && root.online
-            width: parent.width
-            text: root.message(svc.lastError)
-            color: root.urgent
-            font.pixelSize: Style.font.caption
-            wrapMode: Text.WordWrap
-          }
         }
       }
+    }
+  }
+
+  component MapButton: Rectangle {
+    id: mb
+    property string glyph: ""
+    property string tip: ""
+    signal clicked()
+    width: Style.space(28)
+    height: width
+    radius: Style.space(6)
+    color: Qt.rgba(root.panelBackground.r, root.panelBackground.g, root.panelBackground.b, mbMouse.containsMouse && mb.enabled ? 0.95 : 0.8)
+    border.width: 1
+    border.color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, mbMouse.containsMouse && mb.enabled ? 0.5 : 0.2)
+    opacity: enabled ? 1 : 0.4
+
+    Label {
+      anchors.centerIn: parent
+      text: mb.glyph
+      font.pixelSize: Style.font.body
+    }
+    MouseArea {
+      id: mbMouse
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: mb.enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+      onClicked: if (mb.enabled) mb.clicked()
+    }
+  }
+
+  component RoutineCard: Rectangle {
+    id: card
+    property var routine: ({})
+    property string shortcut: ""
+    readonly property bool runnable: (routine.missing || []).length === 0 && svc.pending === ""
+    readonly property bool starting: svc.pending === "routine" && svc.pendingArg === routine.id
+    readonly property bool hot: cardMouse.containsMouse && runnable
+
+    width: parent ? parent.width : 0
+    implicitHeight: cardText.implicitHeight + Style.space(18)
+    radius: Style.space(6)
+    color: hot ? Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.08) : "transparent"
+    border.width: 1
+    border.color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, hot ? 0.45 : 0.18)
+    opacity: (routine.missing || []).length > 0 ? 0.5 : (starting ? 0.7 : 1)
+    scale: cardMouse.pressed && runnable ? 0.98 : 1
+    Behavior on color { ColorAnimation { duration: Style.duration(120) } }
+    Behavior on scale { NumberAnimation { duration: Style.duration(120); easing.type: Easing.OutCubic } }
+
+    Column {
+      id: cardText
+      anchors.left: parent.left
+      anchors.right: modeIcon.left
+      anchors.leftMargin: Style.space(12)
+      anchors.rightMargin: Style.space(10)
+      anchors.verticalCenter: parent.verticalCenter
+      spacing: Style.space(2)
+
+      Label {
+        width: parent.width
+        text: (card.shortcut !== "" ? card.shortcut + "  " : "") + (card.routine.name || "")
+        font.pixelSize: Style.font.bodySmall
+        font.bold: true
+        elide: Text.ElideRight
+      }
+      Label {
+        width: parent.width
+        text: {
+          var r = card.routine
+          if ((r.missing || []).length > 0) return root.tr("error.roomsMissing", "Not on the map: %1").arg(r.missing.join(", "))
+          var parts = [(r.rooms || []).join(", ")]
+          if (r.modeLabel) parts.push(r.modeLabel)
+          if (r.suctionLabel) parts.push(r.suctionLabel)
+          if (r.repeats > 1) parts.push(r.repeats + "×")
+          return parts.join(" · ")
+        }
+        color: root.dim
+        font.pixelSize: Style.font.caption
+        wrapMode: Text.WordWrap
+      }
+    }
+
+    Label {
+      id: modeIcon
+      anchors.right: parent.right
+      anchors.rightMargin: Style.space(12)
+      anchors.verticalCenter: parent.verticalCenter
+      text: card.starting ? root.glyphRefresh : root.modeGlyphs(card.routine.mode)
+      color: card.hot ? root.accentColor : root.foreground
+      font.pixelSize: Style.font.body
+      RotationAnimation on rotation {
+        running: card.starting && !Style.reduceMotion
+        from: 0; to: 360; duration: 900; loops: Animation.Infinite
+      }
+      rotation: 0
+    }
+
+    MouseArea {
+      id: cardMouse
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: card.runnable ? Qt.PointingHandCursor : Qt.ArrowCursor
+      onClicked: if (card.runnable) svc.runRoutine(card.routine.id)
     }
   }
 

@@ -84,6 +84,12 @@ if [[ ! -f $config ]]; then
   fi
 fi
 
+routines="$(dirname "$config")/routines.json"
+if [[ ! -f $routines ]]; then
+  install -D -m 0600 "$here/routines.example.json" "$routines"
+  echo "Example routines written to $routines; edit them to match your rooms."
+fi
+
 systemctl --user enable dreame-vacuum.service >/dev/null 2>&1
 systemctl --user restart dreame-vacuum.service
 
